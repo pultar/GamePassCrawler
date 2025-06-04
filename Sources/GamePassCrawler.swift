@@ -4,6 +4,14 @@ import GamePassKit
 import Logging
 import PostgresNIO
 
+struct DatabaseConnection: Codable {
+    let host: String
+    let username: String
+    let password: String
+    let database: String
+    let port: Int
+}
+
 // MARK: - Primary functions
 
 func saveGameAvailibility(
@@ -126,150 +134,29 @@ func saveGameImages(
     }
 }
 
-// MARK: - Functions with retry
-
-func fetchGameAvailibilityWithRetry(
-    collectionId: String,
-    locale: GamePassLocale,
-    logger: Logger,
-    attempts: Int = 10,
-    delay: Int = 10
-) async throws -> GameCollection {
-    for attempt in 1...attempts {
-        do {
-            logger.info(
-                "Fetching game collection...",
-                metadata: [
-                    "collectionId": "\(collectionId)", "language": "\(locale.language)",
-                    "market": "\(locale.market)", "attempt": "\(attempt)",
-                ]
-            )
-            return try await GamePassCatalog.fetchGameCollection(
-                for: collectionId,
-                language: locale.language,
-                market: locale.market
-            )
-        } catch {
-            logger.error(
-                "Failed to fetch game collection",
-                metadata: [
-                    "apiAttempt": "\(attempt)", "collectionId": "\(collectionId)",
-                    "error": "\(error)",
-                ]
-            )
-            if attempt == attempts { throw error }
-            try await Task.sleep(for: .seconds(delay))
-        }
-    }
-    fatalError("Unreachable")
-}
-
-func saveGameDescriptionsWithRetry(
-    games: [Game],
-    locale: GamePassLocale,
-    client: PostgresClient,
-    logger: Logger,
-    attempts: Int = 10,
-    delay: Int = 10
-) async throws {
-    for attempt in 1...attempts {
-        do {
-            logger.info(
-                "Saving to database...",
-                metadata: [
-                    "language": "\(locale.language)", "market": "\(locale.market)",
-                    "attempt": "\(attempt)",
-                ]
-            )
-            try await saveGameDescriptions(games: games, language: locale.language, market: locale.market, client: client)
-            return
-        } catch {
-            logger.error(
-                "Failed to save to database...",
-                metadata: ["dbAttempt": "\(attempt)", "error": "\(error)"]
-            )
-            if attempt == attempts { throw error }
-            try await Task.sleep(for: .seconds(delay))
-        }
-    }
-}
-
-func saveGameImagesWithRetry(
-    games: [Game],
-    locale: GamePassLocale,
-    client: PostgresClient,
-    logger: Logger,
-    attempts: Int = 10,
-    delay: Int = 10
-) async throws {
-    for attempt in 1...attempts {
-        do {
-            logger.info(
-                "Saving to database...",
-                metadata: [
-                    "language": "\(locale.language)", "market": "\(locale.market)",
-                    "attempt": "\(attempt)",
-                ]
-            )
-            try await saveGameImages(games: games, language: locale.language, market: locale.market, client: client)
-            return
-        } catch {
-            logger.error(
-                "Failed to save to database...",
-                metadata: ["dbAttempt": "\(attempt)", "error": "\(error)"]
-            )
-            if attempt == attempts { throw error }
-            try await Task.sleep(for: .seconds(delay))
-        }
-    }
-}
-
-func saveGameAvailibilityWithRetry(
-    gameCollection: GameCollection,
-    locale: GamePassLocale,
-    client: PostgresClient,
-    logger: Logger,
-    attempts: Int = 10,
-    delay: Int = 10
-) async throws {
-    for attempt in 1...attempts {
-        do {
-            logger.info(
-                "Saving to database...",
-                metadata: [
-                    "language": "\(locale.language)", "market": "\(locale.market)",
-                    "attempt": "\(attempt)",
-                ]
-            )
-            try await saveGameAvailibility(
-                collectionId: GamePassCatalog.kGamePassConsoleIdentifier,
-                gameIds: gameCollection.games,
-                language: locale.language,
-                market: locale.market,
-                date: Date(),
-                client: client
-            )
-            return
-        } catch {
-            logger.error(
-                "Failed to save to database...",
-                metadata: ["dbAttempt": "\(attempt)", "error": "\(error)"]
-            )
-            if attempt == attempts { throw error }
-            try await Task.sleep(for: .seconds(delay))
-        }
-    }
-}
-
 @main struct GamePassCrawler: AsyncParsableCommand {
+    
+    static let configuration = CommandConfiguration(commandName: ProcessInfo.processInfo.processName)
+    
+    @Option(name: .shortAndLong)
+    var configuration = "DatabaseConnection.plist"
+    
     mutating func run() async throws {
         let logger = Logger(label: "ai.fxp.GamePassCrawler")
+        let configFileURL = URL(fileURLWithPath: configuration)
+        guard FileManager.default.fileExists(atPath: configuration) else {
+            fatalError("No configuration file found at \(configuration)")
+        }
+        
+        let databaseConfiguration = try PropertyListDecoder().decode(DatabaseConnection.self, from: Data(contentsOf: configFileURL))
+                                                                     
+                                                                     
         let config = PostgresClient.Configuration(
-            host: "localhost",
-            port: 5432,
-            username: "fpultar",
-            password: "cP5U3tDn",
-            database: "example",
+            host: databaseConfiguration.host,
+            port: databaseConfiguration.port,
+            username: databaseConfiguration.username,
+            password: databaseConfiguration.password,
+            database: databaseConfiguration.database,
             tls: .disable
         )
 
@@ -301,30 +188,19 @@ func saveGameAvailibilityWithRetry(
             taskGroup.addTask { await client.run() }
 
             var gameIdsByLocale = Dictionary<GamePassLocale, Set<String>>()
-            for locale in GamePassCatalog.kSupportedLocales {
-                gameIdsByLocale[locale] = Set()
-            }
+            for locale in GamePassCatalog.kSupportedLocales { gameIdsByLocale[locale] = Set() }
             
             for collectionId in relevantCollectionIds {
                 for locale in GamePassCatalog.kSupportedLocales {
-                    let gameCollection = try await fetchGameAvailibilityWithRetry(
-                        collectionId: collectionId,
-                        locale: locale,
-                        logger: logger,
-                        attempts: 10,
-                        delay: 10,
+                    let gameCollection = try await GamePassCatalog.fetchGameCollection(
+                        for: collectionId,
+                        language: locale.language,
+                        market: locale.market
                     )
-                    
+
                     gameIdsByLocale[locale]?.formUnion(gameCollection.games)
                     
-                    try await saveGameAvailibilityWithRetry(
-                        gameCollection: gameCollection,
-                        locale: locale,
-                        client: client,
-                        logger: logger,
-                        attempts: 10,
-                        delay: 10,
-                    )
+                    try await saveGameAvailibility(collectionId: collectionId, gameIds: gameCollection.games, language: locale.language, market: locale.market, date: Date(), client: client)
                 }
             }
             
@@ -332,8 +208,8 @@ func saveGameAvailibilityWithRetry(
                 if let gameIds = gameIdsByLocale[locale] {
                     logger.info("Unique games for market and language...", metadata: ["count": "\(gameIds.count)", "market": "\(locale.market)", "language": "\(locale.language)"])
                     let games = try await GamePassCatalog.fetchProductInformation(gameIds: Array(gameIds), language: locale.language, market: locale.market)
-                    try await saveGameDescriptionsWithRetry(games: games, locale: locale, client: client, logger: logger, attempts: 10, delay: 10)
-                    try await saveGameImagesWithRetry(games: games, locale: locale, client: client, logger: logger)
+                    try await saveGameDescriptions(games: games, language: locale.language, market: locale.market, client: client)
+                    try await saveGameImages(games: games, language: locale.language, market: locale.market, client: client)
                 }
             }
 
