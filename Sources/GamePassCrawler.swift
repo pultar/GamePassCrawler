@@ -17,19 +17,17 @@ struct DatabaseConnection: Codable {
 func saveGameAvailibility(
     collectionId: String,
     gameIds: [String],
-    language: String,
     market: String,
     date: Date,
     client: PostgresClient
 ) async throws {
     let query = """
-        INSERT INTO game_availability (collection_id, language, market, product_id, available_at)
-        SELECT $1, $2, $3, unnest($4::text[]), $5;
+        INSERT INTO game_availability (collection_id, market, product_id, available_at)
+        SELECT $1, $2, unnest($3::text[]), $4;
         """
 
     var bindings = PostgresBindings()
     bindings.append(collectionId)
-    bindings.append(language)
     bindings.append(market)
     bindings.append(gameIds)
     bindings.append(date)
@@ -45,9 +43,9 @@ func saveGameDescriptions(
     client: PostgresClient
 ) async throws {
     let query = """
-        INSERT INTO game_descriptions (product_id, language, market, product_title, product_description, developer_name, publisher_name, short_title, sort_title, short_description)
-        SELECT unnest($1::text[]), $2, $3, unnest($4::text[]), unnest($5::text[]), unnest($6::text[]), unnest($7::text[]), unnest($8::text[]), unnest($9::text[]), unnest($10::text[])
-        ON CONFLICT (product_id, language, market)
+        INSERT INTO game_descriptions (product_id, language, product_title, product_description, developer_name, publisher_name, short_title, sort_title, short_description)
+        SELECT unnest($1::text[]), $2, unnest($3::text[]), unnest($4::text[]), unnest($5::text[]), unnest($6::text[]), unnest($7::text[]), unnest($8::text[]), unnest($9::text[])
+        ON CONFLICT (product_id, language)
         DO UPDATE SET
             product_title = EXCLUDED.product_title,
             product_description = EXCLUDED.product_description,
@@ -61,7 +59,6 @@ func saveGameDescriptions(
     var bindings = PostgresBindings()
     bindings.append(games.map { $0.productId })
     bindings.append(language)
-    bindings.append(market)
     bindings.append(games.map { $0.productTitle })
     bindings.append(games.map { $0.productDescription ?? "" })
     bindings.append(games.map { $0.developerName ?? "" })
@@ -106,9 +103,9 @@ func saveGameImages(
     }
     
     let query = """
-        INSERT INTO game_images (product_id, language, market, file_id, height, width, uri, image_purpose, image_position_info)
-        SELECT unnest($1::text[]), $2, $3, unnest($4::text[]), unnest($5::int[]), unnest($6::int[]), unnest($7::text[]), unnest($8::text[]), unnest($9::text[])
-        ON CONFLICT (product_id, file_id, language, market, image_purpose, image_position_info)
+        INSERT INTO game_images (product_id, language, file_id, height, width, uri, image_purpose, image_position_info)
+        SELECT unnest($1::text[]), $2, unnest($3::text[]), unnest($4::int[]), unnest($5::int[]), unnest($6::text[]), unnest($7::text[]), unnest($8::text[])
+        ON CONFLICT (product_id, file_id, language, image_purpose, image_position_info)
         DO UPDATE SET
             uri = EXCLUDED.uri,
             height = EXCLUDED.height,
@@ -118,7 +115,6 @@ func saveGameImages(
     var bindings = PostgresBindings()
     bindings.append(productIds)         // $1
     bindings.append(language)           // $2
-    bindings.append(market)             // $3
     bindings.append(fileIds)            // $4
     bindings.append(heights)            // $5
     bindings.append(widths)             // $6
@@ -127,11 +123,7 @@ func saveGameImages(
     bindings.append(imagePositionInfos) // $9
 
     let postgresQuery = PostgresQuery(unsafeSQL: query, binds: bindings)
-    do {
-        try await client.query(postgresQuery)
-    } catch {
-        print(String(reflecting: error))
-    }
+    try await client.query(postgresQuery)
 }
 
 @main struct GamePassCrawler: AsyncParsableCommand {
@@ -161,7 +153,10 @@ func saveGameImages(
         )
 
         let client = PostgresClient(configuration: config)
-        let relevantCollectionIds = [
+        
+        let defaultLanguage = "en-us"
+        let defaultMarket = "US"
+        let collectionIds = [
             GamePassCatalog.kGamePassConsoleIdentifier, GamePassCatalog.kGamePassCoreIdentifier,
             GamePassCatalog.kGamePassStandardIdentifier, GamePassCatalog.kGamePassPcIdentifier,
             GamePassCatalog.kGamePassPcSecondaryIdentifier,
@@ -183,36 +178,61 @@ func saveGameImages(
             GamePassCatalog.kEAPlayConsoleIdentifier, GamePassCatalog.kEAPlayPcIdentifier,
             GamePassCatalog.kEAPlayTrialConsoleIdentifier, GamePassCatalog.kEAPlayTrialPcIdentifier,
         ]
-
+        
         try await withThrowingTaskGroup(of: Void.self) { taskGroup in
             taskGroup.addTask { await client.run() }
-
-            var gameIdsByLocale = Dictionary<GamePassLocale, Set<String>>()
-            for locale in GamePassCatalog.kSupportedLocales { gameIdsByLocale[locale] = Set() }
             
-            for collectionId in relevantCollectionIds {
-                for locale in GamePassCatalog.kSupportedLocales {
-                    let gameCollection = try await GamePassCatalog.fetchGameCollection(
-                        for: collectionId,
-                        language: locale.language,
-                        market: locale.market
-                    )
-
-                    gameIdsByLocale[locale]?.formUnion(gameCollection.games)
-                    
-                    try await saveGameAvailibility(collectionId: collectionId, gameIds: gameCollection.games, language: locale.language, market: locale.market, date: Date(), client: client)
+            // Create a nested task group for fetching and saving games
+            let games = try await withThrowingTaskGroup(of: [String].self) { fetchGroup in
+                for collectionId in collectionIds {
+                    for country in GamePassCatalog.supportedCountries {
+                        fetchGroup.addTask {
+                            let gameCollection = try? await GamePassCatalog.fetchGameCollection(
+                                for: collectionId,
+                                language: defaultLanguage,
+                                market: country
+                            )
+                            
+                            if let gameCollection {
+                                logger.info("\(gameCollection.games.count) games found for \(collectionId) in \(country)")
+                                try await saveGameAvailibility(collectionId: collectionId, gameIds: gameCollection.games, market: country, date: Date(), client: client)
+                                return gameCollection.games
+                            } else {
+                                return []
+                            }
+                        }
+                    }
+                }
+                
+                // Collect all results
+                var collectedGames: Set<String> = []
+                for try await games in fetchGroup {
+                    collectedGames.formUnion(games)
+                }
+                return Array(collectedGames)
+            }
+            
+            await withThrowingTaskGroup(of: Void.self) { fetchGroup in
+                for language in GamePassCatalog.supportedLanguages {
+                    fetchGroup.addTask {
+                        // Chunk the games array into groups of 20
+                        let chunks = games.chunkify(into: 20)
+                        
+                        for (index, chunk) in chunks.enumerated() {
+                            logger.info(">>> Fetching game descriptions for \(language) - chunk \(index + 1)/\(chunks.count)")
+                            let gamesInfo = try await GamePassCatalog.fetchProductInformation(gameIds: chunk, language: language, market: defaultMarket)
+                            
+                            logger.info(">>> Saving game descriptions for \(language) - chunk \(index + 1)/\(chunks.count)")
+                            try await saveGameDescriptions(games: gamesInfo, language: language, market: defaultMarket, client: client)
+                            
+                            logger.info(">>> Saving game images for \(language) - chunk \(index + 1)/\(chunks.count)")
+                            try await saveGameImages(games: gamesInfo, language: language, market: defaultMarket, client: client)
+                        }
+                    }
                 }
             }
             
-            for locale in GamePassCatalog.kSupportedLocales {
-                if let gameIds = gameIdsByLocale[locale] {
-                    logger.info("Unique games for market and language...", metadata: ["count": "\(gameIds.count)", "market": "\(locale.market)", "language": "\(locale.language)"])
-                    let games = try await GamePassCatalog.fetchProductInformation(gameIds: Array(gameIds), language: locale.language, market: locale.market)
-                    try await saveGameDescriptions(games: games, language: locale.language, market: locale.market, client: client)
-                    try await saveGameImages(games: games, language: locale.language, market: locale.market, client: client)
-                }
-            }
-
+            
             taskGroup.cancelAll()
         }
 
